@@ -1,10 +1,22 @@
 const { app, BrowserWindow } = require("electron");
 const { spawn } = require("node:child_process");
 const path = require("node:path");
+const fs = require("node:fs");
 const Store = require("electron-store");
 
 const store = new Store();
 let backendProcess;
+
+function resolveDevPython() {
+  const candidates =
+    process.platform === "win32"
+      ? [path.join(__dirname, "..", "backend", ".venv", "Scripts", "python.exe")]
+      : [path.join(__dirname, "..", "backend", ".venv", "bin", "python")];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "python3";
+}
 
 function startBackend() {
   const port = store.get("backendPort", 8765);
@@ -15,7 +27,8 @@ function startBackend() {
   if (app.isPackaged) {
     backendProcess = spawn(binaryPath, ["--port", String(port)], { stdio: "ignore" });
   } else {
-    backendProcess = spawn("python3", [devPath, "--port", String(port)], { stdio: "inherit" });
+    const devPython = resolveDevPython();
+    backendProcess = spawn(devPython, [devPath, "--port", String(port)], { stdio: "inherit" });
   }
 
   return port;

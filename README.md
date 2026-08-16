@@ -10,7 +10,15 @@
 - SQLite 本地存储
 - GitHub Trending / Hacker News / RSS 采集模块
 - 自定义网站链接提取
-- 本地规则版 AI 分析报告生成器
+- 真实大模型 AI 分析报告（支持通义千问 / DeepSeek / OpenAI / 自定义 OpenAI 兼容接口）
+- AI 设置面板（API Key 仅保存在本机 `~/.info-gap-radar/config.json`，不上传任何服务器）
+
+## AI 模型配置
+
+1. 启动软件后，点击左下角「AI 设置」
+2. 选择服务商（通义千问 / DeepSeek / OpenAI / 自定义），会自动填入对应的接口地址和默认模型
+3. 填入你的 API Key，保存即可
+4. 之后点击任意热点的「AI 分析」按钮，报告会由真实大模型生成；未配置 Key 时会回退到本地模板报告
 
 ## 本地运行
 

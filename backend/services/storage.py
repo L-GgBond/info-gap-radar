@@ -1,7 +1,10 @@
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path.home() / ".info-gap-radar" / "radar.sqlite3"
+
+RANGE_DAYS = {"week": 7, "month": 30, "quarter": 90, "year": 365}
 
 
 def connect():
@@ -24,33 +27,57 @@ def init_db():
                 summary TEXT,
                 raw_text TEXT,
                 ai_report TEXT,
+                content TEXT,
+                language TEXT,
+                translated TEXT,
+                translation_engine TEXT,
+                item_date TEXT,
                 crawl_time TEXT NOT NULL
             )
         """)
+        # 兼容旧库：为已存在的表补齐新增列
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(hot_items)")}
+        migrations = {
+            "item_date": "ALTER TABLE hot_items ADD COLUMN item_date TEXT",
+            "content": "ALTER TABLE hot_items ADD COLUMN content TEXT",
+            "language": "ALTER TABLE hot_items ADD COLUMN language TEXT",
+            "translated": "ALTER TABLE hot_items ADD COLUMN translated TEXT",
+            "translation_engine": "ALTER TABLE hot_items ADD COLUMN translation_engine TEXT",
+        }
+        for col, ddl in migrations.items():
+            if col not in cols:
+                conn.execute(ddl)
 
 
 def save_items(items):
     with connect() as conn:
         for item in items:
             conn.execute("""
-                INSERT INTO hot_items (source, category, title, url, hot_value, summary, raw_text, crawl_time)
-                VALUES (:source, :category, :title, :url, :hot_value, :summary, :raw_text, :crawl_time)
+                INSERT INTO hot_items (source, category, title, url, hot_value, summary, raw_text, item_date, crawl_time)
+                VALUES (:source, :category, :title, :url, :hot_value, :summary, :raw_text, :item_date, :crawl_time)
                 ON CONFLICT(url) DO UPDATE SET
                     title=excluded.title,
                     hot_value=excluded.hot_value,
                     summary=excluded.summary,
                     raw_text=excluded.raw_text,
+                    item_date=excluded.item_date,
                     crawl_time=excluded.crawl_time
             """, item)
 
 
-def list_items(category=None):
+def list_items(category=None, time_range=None):
     query = "SELECT * FROM hot_items"
-    params = []
+    conds, params = [], []
     if category and category != "全部":
-        query += " WHERE category = ?"
+        conds.append("category = ?")
         params.append(category)
-    query += " ORDER BY hot_value DESC, crawl_time DESC LIMIT 120"
+    days = RANGE_DAYS.get((time_range or "").lower())
+    if days:
+        conds.append("COALESCE(item_date, crawl_time) >= ?")
+        params.append((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+    if conds:
+        query += " WHERE " + " AND ".join(conds)
+    query += " ORDER BY hot_value DESC, item_date DESC LIMIT 200"
     with connect() as conn:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
@@ -64,3 +91,11 @@ def get_item(item_id):
 def save_report(item_id, markdown):
     with connect() as conn:
         conn.execute("UPDATE hot_items SET ai_report = ? WHERE id = ?", [markdown, item_id])
+
+
+def save_content(item_id, content, language, translated, translation_engine):
+    with connect() as conn:
+        conn.execute(
+            "UPDATE hot_items SET content = ?, language = ?, translated = ?, translation_engine = ? WHERE id = ?",
+            [content, language, translated, translation_engine, item_id],
+        )
