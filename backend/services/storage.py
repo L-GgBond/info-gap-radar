@@ -77,7 +77,7 @@ def list_items(category=None, time_range=None):
         params.append((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
     if conds:
         query += " WHERE " + " AND ".join(conds)
-    query += " ORDER BY hot_value DESC, item_date DESC LIMIT 200"
+    query += " ORDER BY hot_value DESC, item_date DESC LIMIT 500"
     with connect() as conn:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 

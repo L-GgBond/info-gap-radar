@@ -5,10 +5,10 @@ from pydantic import BaseModel, HttpUrl
 import uvicorn
 
 from services.article import detect_language, fetch_article
-from services.collectors import collect_custom_site, collect_items
+from services.collectors import available_sources, collect_custom_site, collect_items
 from services.config import load_settings, providers_meta, save_settings
-from services.insights import build_report
-from services.llm import analyze_item, llm_configured
+from services.insights import build_digest, build_report, cluster_events, digest_stats, info_gap_summary, top_info_gap_candidates
+from services.llm import analyze_corpus, analyze_item, llm_configured
 from services.storage import (
     get_item,
     init_db,
@@ -20,11 +20,20 @@ from services.storage import (
 from services.translation import translate_to_chinese
 
 
-app = FastAPI(title="信息差雷达 API", version="0.3.0")
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    yield
+
+
+app = FastAPI(title="信息差雷达 API", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -33,15 +42,11 @@ app.add_middleware(
 class CrawlRequest(BaseModel):
     source: str = "all"
     range: str = "all"
+    category: str | None = None
 
 
 class CustomSiteRequest(BaseModel):
     url: HttpUrl
-
-
-@app.on_event("startup")
-def startup():
-    init_db()
 
 
 @app.get("/health")
@@ -56,9 +61,28 @@ def items(category: str | None = None, range: str = "all"):
 
 @app.post("/crawl")
 async def crawl(payload: CrawlRequest):
-    fresh_items = await collect_items(payload.source, payload.range)
+    settings = load_settings()
+    enabled = settings.get("enabled_sources")
+    if not enabled:
+        enabled = [s["id"] for s in available_sources()]
+    fresh_items = await collect_items(payload.source, payload.range, enabled_sources=set(enabled), category=payload.category)
     save_items(fresh_items)
     return {"saved": len(fresh_items), "items": fresh_items}
+
+
+@app.get("/sources")
+def sources():
+    """返回可采集数据源清单（按分类分组），供前端渲染来源开关。"""
+    raw = available_sources()
+    groups = {}
+    for s in raw:
+        groups.setdefault(s["category"], []).append({"id": s["id"], "name": s["name"]})
+    return {
+        "groups": [
+            {"category": category, "sources": srcs}
+            for category, srcs in groups.items()
+        ]
+    }
 
 
 @app.post("/crawl/custom")
@@ -145,11 +169,53 @@ async def report(item_id: int):
     return {"report": markdown, "engine": engine}
 
 
+class ReportRequest(BaseModel):
+    category: str = "全部"
+    range: str = "all"
+
+
+@app.post("/report")
+async def global_report(payload: ReportRequest):
+    items = list_items(payload.category, payload.range)
+    if llm_configured():
+        try:
+            markdown = await analyze_corpus(items, payload.category, payload.range)
+            engine = "llm"
+        except Exception as error:  # noqa: BLE001 - 失败时回退本地聚合，不让前端报错
+            markdown = build_digest(items, payload.category, payload.range)
+            engine = "local"
+            markdown += f"\n\n> 提示：大模型调用失败（{error}），以上为本地聚合结果。"
+    else:
+        markdown = build_digest(items, payload.category, payload.range)
+        engine = "local"
+    return {
+        "report": markdown,
+        "engine": engine,
+        "stats": digest_stats(items, payload.category, payload.range),
+        "candidates": top_info_gap_candidates(items, limit=30),
+        "total": len(items),
+    }
+
+
+@app.get("/insight/summary")
+def insight_summary():
+    items = list_items("全部", "all")
+    return info_gap_summary(items)
+
+
+@app.get("/clusters")
+def clusters(category: str = "全部", range: str = "all"):
+    """跨源事件聚类：把同一事件的多源报道合并，标注境内外分布并量化信息差分。"""
+    items = list_items(category, range)
+    return {"clusters": cluster_events(items), "total": len(items)}
+
+
 class SettingsPayload(BaseModel):
     provider: str | None = None
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
+    enabled_sources: list | None = None
 
 
 @app.get("/settings")
@@ -157,6 +223,7 @@ def get_settings():
     settings = load_settings()
     masked_key = settings.get("api_key", "")
     masked = f"{masked_key[:4]}****{masked_key[-4:]}" if len(masked_key) > 8 else ""
+    enabled = settings.get("enabled_sources") or [s["id"] for s in available_sources()]
     return {
         "providers": providers_meta(),
         "settings": {
@@ -166,6 +233,7 @@ def get_settings():
             "api_key_set": bool(settings["api_key"]),
             "api_key_masked": masked,
             "configured": llm_configured(),
+            "enabled_sources": enabled,
         },
     }
 
@@ -175,6 +243,7 @@ def put_settings(payload: SettingsPayload):
     saved = save_settings(payload.model_dump(exclude_none=True))
     masked_key = saved.get("api_key", "")
     masked = f"{masked_key[:4]}****{masked_key[-4:]}" if len(masked_key) > 8 else ""
+    enabled = saved.get("enabled_sources") or [s["id"] for s in available_sources()]
     return {
         "settings": {
             "provider": saved["provider"],
@@ -183,6 +252,7 @@ def put_settings(payload: SettingsPayload):
             "api_key_set": bool(saved["api_key"]),
             "api_key_masked": masked,
             "configured": llm_configured(),
+            "enabled_sources": enabled,
         }
     }
 
@@ -191,4 +261,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    uvicorn.run("main:app", host="127.0.0.1", port=args.port, reload=False)
+    uvicorn.run(app, host="127.0.0.1", port=args.port, reload=False)

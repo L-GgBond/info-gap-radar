@@ -43,6 +43,8 @@ def load_settings():
                 for key in DEFAULTS:
                     if key in stored:
                         settings[key] = stored[key]
+                if isinstance(stored.get("enabled_sources"), list):
+                    settings["enabled_sources"] = stored["enabled_sources"]
         except (json.JSONDecodeError, OSError):
             pass
     return settings
@@ -54,6 +56,8 @@ def save_settings(payload):
         value = payload.get(key)
         if value is not None:
             settings[key] = str(value).strip()
+    if isinstance(payload.get("enabled_sources"), list):
+        settings["enabled_sources"] = payload["enabled_sources"]
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(
         json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"

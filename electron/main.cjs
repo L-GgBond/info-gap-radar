@@ -2,6 +2,7 @@ const { app, BrowserWindow } = require("electron");
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const fs = require("node:fs");
+const http = require("node:http");
 const Store = require("electron-store");
 
 const store = new Store();
@@ -53,8 +54,38 @@ function createWindow(port) {
   }
 }
 
-app.whenReady().then(() => {
+// 轮询后端健康接口，避免桌面端首屏在后端就绪前发起请求导致 500
+function waitForBackend(port, retries = 40, delay = 400) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const tryOnce = () => {
+      const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
+        res.resume();
+        if (res.statusCode === 200) return resolve();
+        retry();
+      });
+      req.on("error", retry);
+      req.setTimeout(1500, () => {
+        req.destroy();
+        retry();
+      });
+    };
+    function retry() {
+      attempt += 1;
+      if (attempt >= retries) return reject(new Error("后端服务启动超时"));
+      setTimeout(tryOnce, delay);
+    }
+    tryOnce();
+  });
+}
+
+app.whenReady().then(async () => {
   const port = startBackend();
+  try {
+    await waitForBackend(port);
+  } catch (err) {
+    console.error("[信息差雷达] 后端启动超时：", err.message);
+  }
   createWindow(port);
 });
 
