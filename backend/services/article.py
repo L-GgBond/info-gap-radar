@@ -1,7 +1,9 @@
 import httpx
 from bs4 import BeautifulSoup
 
-USER_AGENT = "InfoGapRadar/0.2"
+# 文章页普遍反爬非浏览器 UA，统一用浏览器 UA
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 MAX_TEXT = 12000
 
 

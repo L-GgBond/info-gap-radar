@@ -22,9 +22,15 @@
       <section class="custom-crawl">
         <label for="site-url">自定义站点</label>
         <div class="input-row">
-          <input id="site-url" v-model="customUrl" placeholder="https://github.com/trending" />
+          <input id="site-url" v-model="customUrl" placeholder="https://example.com" />
           <button @click="crawlCustom" :disabled="loading || !customUrl">抓取</button>
         </div>
+        <ul class="site-list" v-if="customSites.length">
+          <li v-for="site in customSites" :key="site.id" :title="site.url">
+            <button class="site-name" @click="recrawlSite(site)">{{ site.title || site.url }}</button>
+            <button class="site-del" @click="removeSite(site)" title="删除">×</button>
+          </li>
+        </ul>
       </section>
 
       <button class="gap-signal" @click="openInsightFromSidebar">
@@ -79,17 +85,38 @@
         <div class="actions">
           <button @click="refresh('github')" :disabled="loading">GitHub</button>
           <button @click="refresh('hn')" :disabled="loading">Hacker News</button>
-          <button class="primary" @click="refresh('all')" :disabled="loading">刷新全部</button>
+          <button class="primary" @click="refresh('all')" :disabled="loading">
+            {{ loading ? "采集中..." : "刷新全部" }}
+          </button>
         </div>
       </header>
 
       <div class="search-row" v-if="viewMode === 'list'">
-        <input v-model="searchQuery" type="search" placeholder="搜索标题 / 来源 / 分类…" />
-        <button v-if="searchQuery" class="ghost" @click="searchQuery = ''">清除</button>
+        <input v-model="searchQuery" type="search" placeholder="搜索标题 / 摘要，支持中英文全文检索…" />
+        <button v-if="searchQuery" class="ghost" @click="clearSearch">清除</button>
+        <button
+          class="ghost"
+          :class="{ active: favoriteOnly }"
+          @click="favoriteOnly = !favoriteOnly"
+        >★ 只看收藏</button>
+        <button class="ghost" @click="batchAnalyze" :disabled="batchLoading || !filteredItems.length">
+          {{ batchLoading ? `批量分析中 ${batchProgress.done}/${batchProgress.total}` : "批量分析前 10 条" }}
+        </button>
         <span class="result-count">{{ filteredItems.length }} 条</span>
       </div>
 
-      <div class="range-row" v-if="viewMode === 'list'">
+        <div class="crawl-report" v-if="lastCrawl && lastCrawl.failed.length && viewMode === 'list'">
+          <span class="cr-text">
+            ⚠ 采集完成：<b>{{ lastCrawl.ok }}</b> 源成功 / <b>{{ lastCrawl.failed.length }}</b> 源失败
+            <template v-if="lastCrawl.prefetch">，后台预抓 {{ lastCrawl.prefetch }} 条全文</template>
+          </span>
+          <span class="cr-failed" :title="lastCrawl.failed.join('、')">
+            {{ lastCrawl.failed.slice(0, 6).join("、") }}{{ lastCrawl.failed.length > 6 ? "…" : "" }}
+          </span>
+          <button class="ghost-sm" @click="lastCrawl = null">关闭</button>
+        </div>
+
+        <div class="range-row" v-if="viewMode === 'list'">
         <span>时间范围：</span>
         <button
           v-for="r in timeRanges"
@@ -103,10 +130,15 @@
 
       <div class="workspace">
         <section class="list" v-if="viewMode === 'list'">
+          <div class="list-empty" v-if="!filteredItems.length && !loading">
+            <div class="list-empty-icon">📡</div>
+            <h3>{{ searchQuery ? "没有匹配的热点" : "暂无热点数据" }}</h3>
+            <p>{{ searchQuery ? "换个关键词试试，或清除搜索查看全部。" : "点击右上角「刷新全部」，雷达会并发扫描 50+ 信息源。" }}</p>
+          </div>
           <article
             v-for="item in filteredItems"
             :key="item.id || item.url"
-            :class="{ selected: selectedItem?.url === item.url }"
+            :class="{ selected: selectedItem?.id === item.id, read: item.read, analyzed: item.analyzed }"
             :style="{ '--cat': CATEGORY_COLORS[item.category] || '#0f5c58' }"
             @click="selectItem(item)"
           >
@@ -114,23 +146,47 @@
               <span class="cat"><i class="dot"></i>{{ item.category }}</span>
               <span class="src">{{ item.source }}</span>
               <span class="time">{{ timeAgo(item.item_date) }}</span>
-              <strong v-if="item.hot_value">{{ item.hot_value }}</strong>
+              <strong v-if="item.hot_value" :title="`原始热度 ${item.hot_value} / 归一化 ${item.hot_score}`">
+                {{ Math.round(item.hot_score || 0) }}
+              </strong>
+              <button
+                class="star"
+                :class="{ on: item.favorite }"
+                :title="item.favorite ? '取消收藏' : '收藏'"
+                @click.stop="toggleFlag(item, 'favorite')"
+              >{{ item.favorite ? "★" : "☆" }}</button>
             </div>
             <h3>{{ item.title }}</h3>
             <p>{{ item.summary }}</p>
           </article>
+          <div class="list-more" v-if="hasMore && viewMode === 'list'">
+            <button class="ghost" @click="loadItems({ append: true })" :disabled="loadingMore">
+              {{ loadingMore ? "加载中…" : "加载更多" }}
+            </button>
+          </div>
         </section>
 
         <section class="report" v-if="viewMode === 'list'">
           <template v-if="selectedItem">
             <div class="report-head">
               <div>
-                <p class="eyebrow">{{ selectedItem.source }}</p>
+                <p class="eyebrow">
+                  {{ selectedItem.source }}
+                  <i class="analyzed-tag" v-if="selectedItem.analyzed">已分析</i>
+                </p>
                 <h2>{{ selectedItem.title }}</h2>
               </div>
-              <button class="primary" @click="generateReport" :disabled="reportLoading">
-                {{ reportLoading ? "分析中..." : "AI 分析" }}
-              </button>
+              <div class="report-actions">
+                <button class="ghost" @click="toggleFlag(selectedItem, 'favorite')">
+                  {{ selectedItem.favorite ? "★ 已收藏" : "☆ 收藏" }}
+                </button>
+                <button class="ghost" @click="hideItem(selectedItem)" title="从列表隐藏">隐藏</button>
+                <button class="ghost" v-if="reportHtml" @click="exportReport">导出 MD</button>
+                <button class="ghost" v-if="reportHtml" @click="printReport">打印/PDF</button>
+                <button class="primary" @click="generateReport" :disabled="reportLoading">
+                  {{ reportLoading ? "分析中..." : streaming ? "生成中..." : "AI 分析" }}
+                </button>
+              </div>
             </div>
             <a :href="selectedItem.url" target="_blank" rel="noreferrer">打开来源</a>
 
@@ -169,7 +225,7 @@
           </template>
           <div v-else class="empty">
             <h2>选择一条热点查看分析</h2>
-            <p>在左下角「AI 设置」里填入大模型 API Key 后，报告将由真实大模型生成；未配置时会先用本地模板占位。</p>
+            <p>在左下角「AI 设置」里填入大模型 API Key 后，报告将由真实大模型生成（流式输出）；未配置时会先用本地模板占位。</p>
           </div>
         </section>
 
@@ -285,7 +341,7 @@
 
     <div v-if="showSettings" class="modal-mask" @click.self="showSettings = false">
       <div class="modal">
-        <h2>AI 模型设置</h2>
+        <h2>AI 模型与监控设置</h2>
         <p class="modal-tip">API Key 只保存在本机用户目录，不会上传任何服务器。</p>
 
         <label class="field-label">服务商</label>
@@ -314,6 +370,21 @@
         <label class="field-label" for="model-name">模型名称</label>
         <input id="model-name" v-model="draft.model" placeholder="例如 qwen-plus / deepseek-chat / gpt-4o-mini" />
 
+        <div class="settings-inline">
+          <div>
+            <label class="field-label" for="max-tokens">报告最大长度（tokens）</label>
+            <input id="max-tokens" v-model.number="draft.max_tokens" type="number" min="256" max="32000" />
+          </div>
+          <div>
+            <label class="field-label" for="cleanup-days">数据保留（天）</label>
+            <input id="cleanup-days" v-model.number="draft.cleanup_days" type="number" min="7" max="3650" />
+          </div>
+        </div>
+
+        <button class="ghost test-conn" @click="testConn" :disabled="testingConn">
+          {{ testingConn ? "测试中…" : (connResult || "测试 AI 连接") }}
+        </button>
+
         <div class="sources-block">
           <div class="sources-head">
             <label class="field-label">抓取来源（勾选要采集的源）</label>
@@ -340,9 +411,49 @@
                     @change="toggleSource(src.id)"
                   />
                   <span>{{ src.name }}</span>
+                  <button
+                    v-if="src.custom"
+                    class="feed-del"
+                    title="删除该订阅源"
+                    @click.prevent="removeFeed(src)"
+                  >×</button>
                 </label>
               </div>
             </div>
+          </div>
+
+          <div class="feeds-manager">
+            <div class="feeds-add-row">
+              <input v-model="feedDraft.name" placeholder="名称（可留空自动取域名）" class="feed-name" />
+              <input v-model="feedDraft.url" placeholder="RSS 地址 https://…/feed" class="feed-url" />
+              <select v-model="feedDraft.category">
+                <option v-for="c in categories.filter(x => x !== '全部' && x !== '自定义站点')" :key="c" :value="c">{{ c }}</option>
+              </select>
+              <button class="ghost-sm" @click="addFeed" :disabled="!feedDraft.url">添加 RSS</button>
+            </div>
+            <div class="feeds-opml">
+              <button class="ghost-sm" @click="importOpml">导入 OPML</button>
+              <a class="ghost-sm" :href="`${apiBase}/feeds/export`" target="_blank" rel="noreferrer">导出 OPML</a>
+              <span class="feeds-hint">支持从其他阅读器迁移订阅</span>
+            </div>
+            <div class="mirror-row">
+              <label for="rsshub-mirror">RSSHub 镜像（被墙源自动兜底，可自建）</label>
+              <input id="rsshub-mirror" v-model="draft.rsshub_mirror" placeholder="https://rsshub.app" />
+            </div>
+          </div>
+        </div>
+
+        <div class="keywords-block">
+          <label class="field-label" for="watch-keywords">关键词监控（每行一个，采集到新命中时弹系统通知）</label>
+          <textarea
+            id="watch-keywords"
+            v-model="draft.watch_keywords_text"
+            rows="3"
+            placeholder="例如：&#10;rust&#10;AI 芯片&#10;融资"
+          ></textarea>
+          <div class="keywords-actions">
+            <button class="ghost-sm" @click="enableNotifications">开启通知权限</button>
+            <span class="feeds-hint">{{ notifyState }}</span>
           </div>
         </div>
 
@@ -363,7 +474,7 @@ import hljs from "highlight.js";
 import "highlight.js/styles/atom-one-dark.css";
 
 const apiBase = new URLSearchParams(window.location.search).get("api") || "http://127.0.0.1:8765";
-const categories = [
+const FALLBACK_CATEGORIES = [
   "全部",
   "人工智能",
   "编程开发",
@@ -377,6 +488,7 @@ const categories = [
   "科学",
   "自定义站点"
 ];
+const categories = ref([...FALLBACK_CATEGORIES]);
 const CATEGORY_COLORS = {
   "人工智能": "#7c5cff",
   "编程开发": "#2f9e6e",
@@ -414,11 +526,14 @@ const selectedCategory = ref("全部");
 const selectedRange = ref("all");
 const customUrl = ref("");
 const searchQuery = ref("");
+const favoriteOnly = ref(false);
 const items = ref([]);
 const loading = ref(false);
 const reportLoading = ref(false);
+const streaming = ref(false);
 const selectedItem = ref(null);
 const reportHtml = ref("");
+const reportRaw = ref("");
 const reportError = ref("");
 const statusText = ref("本地数据库准备就绪，点击刷新开始采集。");
 
@@ -439,14 +554,29 @@ const gapSummary = reactive({ total: 0, foreign: 0, pending: 0, candidates: 0 })
 const showSettings = ref(false);
 const savingSettings = ref(false);
 const providers = ref([]);
-const settings = reactive({ provider: "dashscope", base_url: "", model: "", api_key_set: false, api_key_masked: "", configured: false, enabled_sources: [] });
-const draft = reactive({ provider: "dashscope", api_key: "", base_url: "", model: "" });
+const settings = reactive({
+  provider: "dashscope", base_url: "", model: "", api_key_set: false, api_key_masked: "",
+  configured: false, enabled_sources: [], watch_keywords: [], max_tokens: 2000, cleanup_days: 180,
+  rsshub_mirror: "https://rsshub.app"
+});
+const draft = reactive({ provider: "dashscope", api_key: "", base_url: "", model: "", watch_keywords_text: "", max_tokens: 2000, cleanup_days: 180, rsshub_mirror: "" });
+const testingConn = ref(false);
+const connResult = ref("");
 
 const sourcesGroups = ref([]);
 const sourcesLoaded = ref(false);
 const enabledSources = ref([]);
 const draftEnabled = ref([]);
 const totalSourceCount = computed(() => sourcesGroups.value.reduce((n, g) => n + g.sources.length, 0));
+const feedDraft = reactive({ name: "", url: "", category: "科技" });
+
+const customSites = ref([]);
+const batchLoading = ref(false);
+const batchProgress = reactive({ done: 0, total: 0 });
+const lastCrawl = ref(null);
+const hasMore = ref(false);
+const loadingMore = ref(false);
+const PAGE_SIZE = 500;
 
 const contentState = reactive({ loading: false, error: "", content: "", translated: "", language: "", fallback: false, fallback_reason: "" });
 const contentTab = ref("original");
@@ -461,7 +591,8 @@ const filteredItems = computed(() => {
     list = list.filter((item) => item.category === selectedCategory.value);
   }
   const q = searchQuery.value.trim().toLowerCase();
-  if (q) {
+  if (q && q.length < 2) {
+    // 过短的关键词不做服务端搜索，退化为本地过滤
     list = list.filter((item) =>
       (item.title + " " + item.source + " " + item.category).toLowerCase().includes(q)
     );
@@ -530,6 +661,27 @@ watch(selectedRange, () => {
   });
 });
 
+watch(selectedCategory, () => {
+  if (searchQuery.value && searchQuery.value.trim().length >= 2) return; // 搜索态由搜索逻辑接管
+  loadItems().catch(() => {});
+});
+
+// 搜索防抖：2 字符以上走服务端 FTS 全文检索（覆盖全部库内数据）
+let searchTimer = null;
+watch(searchQuery, () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    const q = searchQuery.value.trim();
+    if (q.length >= 2) {
+      loadItems().catch(() => {});
+    }
+  }, 350);
+});
+
+function clearSearch() {
+  searchQuery.value = "";
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`${apiBase}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -575,6 +727,17 @@ function applySettingsMeta(data) {
   if (Array.isArray(data.settings?.enabled_sources)) {
     enabledSources.value = data.settings.enabled_sources;
   }
+  if (Array.isArray(data.settings?.watch_keywords)) {
+    settings.watch_keywords = data.settings.watch_keywords;
+  }
+  rebuildCategories();
+}
+
+// 分类词表以后端 /sources 为准，避免前后端各写一份导致漂移
+function rebuildCategories() {
+  const set = new Set(FALLBACK_CATEGORIES);
+  for (const group of sourcesGroups.value) set.add(group.category);
+  categories.value = [...set];
 }
 
 async function loadSettings() {
@@ -590,8 +753,18 @@ async function loadSources() {
     const data = await api("/sources");
     sourcesGroups.value = data.groups || [];
     sourcesLoaded.value = true;
+    rebuildCategories();
   } catch {
     sourcesLoaded.value = false;
+  }
+}
+
+async function loadCustomSites() {
+  try {
+    const data = await api("/custom-sites");
+    customSites.value = data.sites || [];
+  } catch {
+    // 非关键数据，失败不提示
   }
 }
 
@@ -600,7 +773,12 @@ function openSettings() {
   draft.api_key = "";
   draft.base_url = settings.base_url || "";
   draft.model = settings.model || "";
+  draft.max_tokens = settings.max_tokens || 2000;
+  draft.cleanup_days = settings.cleanup_days || 180;
+  draft.rsshub_mirror = settings.rsshub_mirror || "";
+  draft.watch_keywords_text = (settings.watch_keywords || []).join("\n");
   draftEnabled.value = [...enabledSources.value];
+  connResult.value = "";
   showSettings.value = true;
 }
 
@@ -633,6 +811,93 @@ function setAllSources(on) {
   }
 }
 
+async function addFeed() {
+  if (!feedDraft.url.trim()) return;
+  try {
+    const data = await api("/feeds", {
+      method: "POST",
+      body: JSON.stringify({
+        name: feedDraft.name.trim() || new URL(feedDraft.url).hostname,
+        url: feedDraft.url.trim(),
+        category: feedDraft.category
+      })
+    });
+    feedDraft.name = "";
+    feedDraft.url = "";
+    await refreshFeeds(data.feeds);
+    statusText.value = "订阅源已添加，保存设置后参与采集。";
+  } catch (error) {
+    statusText.value = `添加订阅源失败：${error.message}`;
+  }
+}
+
+async function removeFeed(src) {
+  // src.id 形如 "feed:3"
+  const feedId = Number(String(src.id).split(":")[1]);
+  if (!feedId) return;
+  try {
+    const data = await api(`/feeds/${feedId}`, { method: "DELETE" });
+    await refreshFeeds(data.feeds);
+  } catch (error) {
+    statusText.value = `删除订阅源失败：${error.message}`;
+  }
+}
+
+async function refreshFeeds() {
+  await loadSources();
+}
+
+async function importOpml() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".opml,.xml,text/xml";
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = await api("/feeds/import", { method: "POST", body: JSON.stringify({ opml: text }) });
+      await loadSources();
+      statusText.value = `OPML 导入完成：${data.imported} 个订阅源。`;
+    } catch (error) {
+      statusText.value = `OPML 导入失败：${error.message}`;
+    }
+  };
+  input.click();
+}
+
+async function testConn() {
+  testingConn.value = true;
+  connResult.value = "";
+  try {
+    const result = await api("/settings/test", {
+      method: "POST",
+      body: JSON.stringify({
+        base_url: draft.base_url,
+        model: draft.model,
+        api_key: draft.api_key || undefined
+      })
+    });
+    connResult.value = `连接成功：${result.model}（${result.latency_ms}ms）`;
+  } catch (error) {
+    connResult.value = `连接失败：${error.message.slice(0, 120)}`;
+  } finally {
+    testingConn.value = false;
+  }
+}
+
+const notifyState = computed(() => {
+  if (typeof Notification === "undefined") return "当前环境不支持系统通知";
+  if (Notification.permission === "granted") return "系统通知已开启";
+  if (Notification.permission === "denied") return "通知被系统拒绝，请在系统设置中允许";
+  return "尚未开启系统通知";
+});
+
+function enableNotifications() {
+  if (typeof Notification === "undefined") return;
+  Notification.requestPermission();
+}
+
 function chooseProvider(provider) {
   draft.provider = provider.id;
   if (provider.id !== "custom") {
@@ -648,6 +913,10 @@ async function saveSettings() {
       provider: draft.provider,
       base_url: draft.base_url,
       model: draft.model,
+      max_tokens: draft.max_tokens,
+      cleanup_days: draft.cleanup_days,
+      rsshub_mirror: draft.rsshub_mirror.trim(),
+      watch_keywords: draft.watch_keywords_text.split("\n").map((s) => s.trim()).filter(Boolean),
       enabled_sources: draftEnabled.value
     };
     if (draft.api_key) payload.api_key = draft.api_key;
@@ -661,16 +930,61 @@ async function saveSettings() {
   }
 }
 
-async function loadItems() {
-  const query = new URLSearchParams({ range: selectedRange.value, category: selectedCategory.value });
+async function loadItems({ append = false } = {}) {
+  const query = new URLSearchParams({
+    range: selectedRange.value,
+    category: selectedCategory.value,
+    favorite: favoriteOnly.value ? "true" : "false",
+    limit: String(PAGE_SIZE),
+    offset: String(append ? items.value.length : 0)
+  });
+  const q = searchQuery.value.trim();
+  if (q.length >= 2) query.set("q", q);
   const data = await api(`/items?${query.toString()}`);
-  items.value = data.items;
+  items.value = append ? items.value.concat(data.items) : data.items;
+  hasMore.value = data.items.length >= PAGE_SIZE;
   loadGapSummary();
+  checkWatchKeywords(data.items);
+}
+
+// ===== 关键词监控：新采集命中关键词 → 系统通知 =====
+function checkWatchKeywords(freshItems) {
+  const keywords = settings.watch_keywords || [];
+  if (!keywords.length || typeof Notification === "undefined" || Notification.permission !== "granted") {
+    return;
+  }
+  const lastSeen = localStorage.getItem("igr-last-seen");
+  const now = new Date().toISOString();
+  if (!lastSeen) {
+    localStorage.setItem("igr-last-seen", now);
+    return; // 首次只建立基线，避免历史条目刷屏
+  }
+  const hits = [];
+  for (const it of freshItems) {
+    if ((it.crawl_time || "") <= lastSeen) continue;
+    const haystack = `${it.title || ""} ${it.summary || ""}`;
+    if (keywords.some((kw) => haystack.includes(kw))) hits.push(it);
+  }
+  localStorage.setItem("igr-last-seen", now);
+  // 最多弹 3 条，避免打扰
+  for (const hit of hits.slice(0, 3)) {
+    try {
+      new Notification(`关键词命中：${hit.source}`, {
+        body: (hit.title || "").slice(0, 120),
+        silent: false
+      });
+    } catch {
+      // 通知失败不影响主流程
+    }
+  }
+  if (hits.length > 3) {
+    statusText.value = `关键词命中 ${hits.length} 条（仅弹出前 3 条），请在列表中查看。`;
+  }
 }
 
 async function refresh(source) {
   loading.value = true;
-  statusText.value = "正在采集热点...";
+  statusText.value = "正在并发采集热点...";
   try {
     const category = source === "all" && selectedCategory.value !== "全部" ? selectedCategory.value : null;
     const data = await api("/crawl", {
@@ -678,7 +992,15 @@ async function refresh(source) {
       body: JSON.stringify({ source, range: selectedRange.value, category })
     });
     await loadItems();
-    statusText.value = `已更新 ${data.saved} 条热点。`;
+    lastCrawl.value = {
+      ok: data.ok_sources,
+      failed: data.failed_sources || [],
+      prefetch: data.prefetch || 0
+    };
+    const failed = data.failed_sources || [];
+    const failNote = failed.length ? `，失败 ${failed.length} 源` : "";
+    statusText.value = `采集完成：${data.ok_sources} 源成功 / ${data.saved} 条热点${failNote}` +
+      (data.prefetch ? `，后台预抓 ${data.prefetch} 条全文` : "");
   } catch (error) {
     statusText.value = `采集失败：${error.message}`;
   } finally {
@@ -696,7 +1018,9 @@ async function crawlCustom() {
     });
     selectedCategory.value = "自定义站点";
     await loadItems();
-    statusText.value = `自定义站点已提取 ${data.saved} 条候选内容。`;
+    await loadCustomSites();
+    customUrl.value = "";
+    statusText.value = `「${data.site_title}」已提取 ${data.saved} 条候选内容。`;
   } catch (error) {
     statusText.value = `抓取失败：${error.message}`;
   } finally {
@@ -704,16 +1028,90 @@ async function crawlCustom() {
   }
 }
 
-function selectItem(item) {
+async function recrawlSite(site) {
+  loading.value = true;
+  statusText.value = `重新抓取 ${site.title || site.url} ...`;
+  try {
+    const data = await api("/crawl/custom", {
+      method: "POST",
+      body: JSON.stringify({ url: site.url })
+    });
+    selectedCategory.value = "自定义站点";
+    await loadItems();
+    statusText.value = `「${data.site_title}」更新 ${data.saved} 条。`;
+  } catch (error) {
+    statusText.value = `抓取失败：${error.message}`;
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function removeSite(site) {
+  try {
+    await api(`/custom-sites/${site.id}`, { method: "DELETE" });
+    await loadCustomSites();
+  } catch (error) {
+    statusText.value = `删除站点失败：${error.message}`;
+  }
+}
+
+async function toggleFlag(item, flag) {
+  try {
+    await api(`/items/${item.id}/flags`, {
+      method: "PATCH",
+      body: JSON.stringify({ [flag]: !item[flag] })
+    });
+    item[flag] = item[flag] ? 0 : 1;
+    if (selectedItem.value?.id === item.id) selectedItem.value[flag] = item[flag];
+    if (flag === "favorite" && favoriteOnly.value) await loadItems();
+  } catch (error) {
+    statusText.value = `操作失败：${error.message}`;
+  }
+}
+
+async function hideItem(item) {
+  try {
+    await api(`/items/${item.id}/flags`, {
+      method: "PATCH",
+      body: JSON.stringify({ hidden: true })
+    });
+    items.value = items.value.filter((it) => it.id !== item.id);
+    if (selectedItem.value?.id === item.id) selectedItem.value = null;
+    statusText.value = "已隐藏该条目（可在数据库中恢复，收藏不受影响）。";
+  } catch (error) {
+    statusText.value = `隐藏失败：${error.message}`;
+  }
+}
+
+async function selectItem(item) {
   selectedItem.value = item;
   reportError.value = "";
-  reportHtml.value = item.ai_report ? renderMarkdown(item.ai_report) : "";
+  reportHtml.value = "";
+  reportRaw.value = "";
   contentTab.value = "original";
   contentState.content = "";
   contentState.translated = "";
   contentState.error = "";
   contentState.fallback = false;
   contentState.fallback_reason = "";
+  // 拉完整条目（含已缓存报告），并标记已读
+  try {
+    const full = await api(`/items/${item.id}`);
+    Object.assign(item, {
+      ai_report: full.ai_report,
+      analyzed: !!(full.ai_report && full.ai_report.length)
+    });
+    if (full.ai_report) {
+      reportRaw.value = full.ai_report;
+      setMarkdown(reportHtml, full.ai_report);
+    }
+  } catch {
+    // 详情拉取失败不阻塞
+  }
+  if (!item.read) {
+    item.read = 1;
+    api(`/items/${item.id}/flags`, { method: "PATCH", body: JSON.stringify({ read: true }) }).catch(() => {});
+  }
   loadContent(item.id);
 }
 
@@ -722,12 +1120,12 @@ async function loadContent(itemId) {
   contentState.error = "";
   try {
     const data = await api(`/items/${itemId}/content`);
-  contentState.content = data.content || "";
-  contentState.translated = data.translated || "";
-  contentState.language = data.language || "";
-  contentState.fallback = !!data.fallback;
-  contentState.fallback_reason = data.fallback_reason || "";
-  if (!contentState.translated) contentTab.value = "original";
+    contentState.content = data.content || "";
+    contentState.translated = data.translated || "";
+    contentState.language = data.language || "";
+    contentState.fallback = !!data.fallback;
+    contentState.fallback_reason = data.fallback_reason || "";
+    if (!contentState.translated) contentTab.value = "original";
   } catch (error) {
     contentState.error = error.message;
   } finally {
@@ -737,21 +1135,120 @@ async function loadContent(itemId) {
 
 async function generateReport() {
   if (!selectedItem.value?.id) return;
+  const itemId = selectedItem.value.id;
   reportLoading.value = true;
+  streaming.value = false;
   reportError.value = "";
+  reportHtml.value = "";
+  reportRaw.value = "";
+  let streamed = false;
   try {
-    const data = await api(`/items/${selectedItem.value.id}/report`, { method: "POST" });
-    setMarkdown(reportHtml, data.report);
-    selectedItem.value.ai_report = data.report;
-    await loadGapSummary();
-    if (data.engine === "local") {
-      statusText.value = "未配置 AI Key，当前为本地模板报告；到「AI 设置」配置后可获得真实分析。";
+    // 优先流式：逐块渲染，边生成边看
+    const response = await fetch(`${apiBase}/items/${itemId}/report/stream`, { method: "POST" });
+    if (response.ok) {
+      streaming.value = true;
+      streamed = true;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      let lastPaint = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        const now = Date.now();
+        if (now - lastPaint > 120) {
+          // 节流渲染，避免高频重绘
+          lastPaint = now;
+          reportRaw.value = acc;
+          setMarkdown(reportHtml, acc);
+        }
+      }
+      reportRaw.value = acc;
+      setMarkdown(reportHtml, acc);
+      selectedItem.value.ai_report = acc;
+      selectedItem.value.analyzed = true;
+    } else {
+      // 未配置（400）或其他错误 → 回退非流式接口（本地模板也在那里）
+      await generateReportFallback(itemId);
     }
   } catch (error) {
-    reportError.value = error.message;
+    if (!streamed) {
+      try {
+        await generateReportFallback(itemId);
+      } catch (fallbackError) {
+        reportError.value = fallbackError.message;
+      }
+    } else {
+      reportError.value = `流式中断：${error.message}`;
+    }
   } finally {
+    streaming.value = false;
     reportLoading.value = false;
   }
+}
+
+async function generateReportFallback(itemId) {
+  const data = await api(`/items/${itemId}/report`, { method: "POST" });
+  reportRaw.value = data.report;
+  setMarkdown(reportHtml, data.report);
+  const target = items.value.find((it) => it.id === itemId);
+  if (target) {
+    target.ai_report = data.report;
+    target.analyzed = true;
+  }
+  if (selectedItem.value?.id === itemId) {
+    selectedItem.value.ai_report = data.report;
+    selectedItem.value.analyzed = true;
+  }
+  await loadGapSummary();
+  if (data.engine === "local") {
+    statusText.value = "未配置 AI Key，当前为本地模板报告；到「AI 设置」配置后可获得真实分析。";
+  }
+}
+
+async function batchAnalyze() {
+  const pending = filteredItems.value.filter((it) => !it.analyzed).slice(0, 10);
+  if (!pending.length) {
+    statusText.value = "当前列表没有待分析条目。";
+    return;
+  }
+  batchLoading.value = true;
+  batchProgress.total = pending.length;
+  batchProgress.done = 0;
+  statusText.value = `批量分析中（共 ${pending.length} 条）…`;
+  let ok = 0;
+  for (const item of pending) {
+    try {
+      const data = await api(`/items/${item.id}/report`, { method: "POST" });
+      item.ai_report = data.report;
+      item.analyzed = true;
+      ok += 1;
+    } catch {
+      // 单条失败继续下一条
+    }
+    batchProgress.done += 1;
+    statusText.value = `批量分析进度 ${batchProgress.done}/${batchProgress.total}`;
+  }
+  batchLoading.value = false;
+  await loadGapSummary();
+  statusText.value = `批量分析完成：成功 ${ok} / 共 ${pending.length} 条。`;
+}
+
+function exportReport() {
+  if (!reportRaw.value) return;
+  const blob = new Blob([reportRaw.value], { type: "text/markdown;charset=utf-8" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `报告-${(selectedItem.value?.title || "info-gap").slice(0, 40).replace(/[\\/:*?"<>|]/g, "_")}.md`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function printReport() {
+  document.body.classList.add("printing-report");
+  window.print();
+  setTimeout(() => document.body.classList.remove("printing-report"), 500);
 }
 
 async function generateInsight() {
@@ -793,8 +1290,13 @@ function openInsightFromSidebar() {
 }
 
 function openCandidate(c) {
-  selectItem(c);
   viewMode.value = "list";
+  selectedCategory.value = c.category || "全部";
+  // 候选条目来自全库查询，先切换分类再选中
+  loadItems().then(() => {
+    const target = items.value.find((it) => it.id === c.id);
+    if (target) selectItem(target);
+  });
 }
 
 async function loadClusters() {
@@ -810,10 +1312,15 @@ async function loadClusters() {
   }
 }
 
+watch(favoriteOnly, () => {
+  loadItems().catch(() => {});
+});
+
 onMounted(() => {
   applyTheme();
   loadSettings();
   loadSources();
+  loadCustomSites();
   loadGapSummary();
   applyAutoCruise();
   loadItems().catch(() => {

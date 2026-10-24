@@ -1,6 +1,8 @@
 import math
 import re
 
+from services.collectors import DOMESTIC_SOURCES
+
 
 def build_report(item):
     title = item.get("title", "")
@@ -35,21 +37,26 @@ def build_report(item):
 DOMESTIC_HINTS = [
     "中文", "中国", "网易", "知乎", "微博", "36氪", "少数派", "掘金", "开源中国",
     "机器之心", "量子位", "虎嗅", "钛媒体", "澎湃", "界面", "新浪", "腾讯", "阿里",
-    "百度", "infoq", "csdn", "juejin", "sspai",
+    "百度", "抖音", "bilibili", "b站", "infoq", "csdn", "juejin", "sspai",
+    "ithome", "ifanr", "geekpark", "qbitai", "jiqizhixin", "solidot", "v2ex",
+    "huxiu", "36kr",
 ]
 
 
 def _is_foreign(item):
-    """粗略判断是否为境外来源：命中中文线索或 zh 语言视为国内，其余视为境外。"""
-    src = (item.get("source") or "").lower()
-    if any(h.lower() in src for h in DOMESTIC_HINTS):
+    """判断是否为境外来源：先按内置境内源名单精确匹配，再按名称/语言线索兜底。"""
+    src = (item.get("source") or "").strip()
+    if src in DOMESTIC_SOURCES:
+        return False
+    src_l = src.lower()
+    if any(h.lower() in src_l for h in DOMESTIC_HINTS):
         return False
     lang = (item.get("language") or "").lower()
     if lang in ("zh", "zh-cn", "zh_cn", "chinese"):
         return False
     if lang in ("en", "english"):
         return True
-    # 未标注语言：绝大多数 RSS 源为英文，默认按境外处理以放大信息差信号
+    # 未标注语言：绝大多数采集源为英文，默认按境外处理以放大信息差信号
     return True
 
 
@@ -206,7 +213,16 @@ def info_gap_summary(items):
     }
 
 
-def cluster_events(items, threshold=0.3, limit=25):
+CLUSTER_STOPWORDS = {
+    "the", "a", "an", "of", "to", "and", "in", "is", "are", "for", "on", "with",
+    "how", "why", "what", "new", "study", "report", "says", "after", "from", "at",
+    "as", "by", "it", "this", "that", "be", "was", "were", "will", "can", "your",
+    "about", "into", "up", "out", "over", "not", "but", "its", "has", "have",
+    "best", "top", "vs", "using", "use", "get", "one", "two",
+}
+
+
+def cluster_events(items, threshold=0.25, limit=25):
     """按标题相似度聚合同一事件的多源报道，量化"信息差"信号。
 
     返回聚类列表（按信息差分降序），每个聚类含代表标题、来源覆盖、境内外分布与成员。
@@ -216,7 +232,10 @@ def cluster_events(items, threshold=0.3, limit=25):
 
     def tokenize(title):
         t = (title or "").lower()
-        toks = set(re.findall(r"[a-z0-9]+", t))
+        toks = {
+            tok for tok in re.findall(r"[a-z0-9]+", t)
+            if len(tok) >= 2 and tok not in CLUSTER_STOPWORDS
+        }
         cn = re.sub(r"[\s\W_]+", "", re.sub(r"[a-z0-9]+", "", t))
         for i in range(len(cn) - 1):
             toks.add(cn[i:i + 2])
